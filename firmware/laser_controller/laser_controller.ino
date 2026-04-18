@@ -26,8 +26,8 @@
 // ---------------------------------------------------------------------------
 // PWM / modulation parameters  (edit these to change operating limits)
 // ---------------------------------------------------------------------------
-#define MAX_FREQ_HZ       25000    // Maximum modulation frequency (Hz)  [manual p.44]
-#define MIN_PULSE_US      1        // Minimum pulse width (microseconds) [manual p.44]
+#define MAX_FREQ_HZ       100000   // Maximum modulation frequency (Hz)  [manual p.44]
+#define MIN_PULSE_US      2        // Minimum pulse width (microseconds) [manual p.44]
 #define PWM_RESOLUTION    12       // PWM bit depth; 4096 counts
 
 // Derived: below this power fraction the pulse-width-hold regime activates.
