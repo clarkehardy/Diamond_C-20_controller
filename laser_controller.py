@@ -302,13 +302,13 @@ def demo_timed_burst(laser: LaserController, power: float, duration_ms: int) -> 
     """Fire a single timed burst at the given power level, then confirm it stops."""
     print(f"\n=== Timed burst: power={power:.3f}, duration={duration_ms} ms ===")
     laser.set_power(power)
+    laser.on(duration_ms=duration_ms)
     status = laser.get_status()
     freq   = status.get("freq",  "--")
     duty   = status.get("duty",  "--")
     print(f"  Calculated frequency: {freq} Hz")
     print(f"  Calculated duty cycle: {duty}")
     print(f"  Firing for {duration_ms} ms...")
-    laser.on(duration_ms=duration_ms)
 
     # Poll until the firmware stops the laser automatically.
     wait_s = duration_ms / 1000.0 + 0.5
