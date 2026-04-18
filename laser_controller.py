@@ -13,6 +13,7 @@ See protocol.md for the full serial command reference.
 """
 
 import argparse
+import queue
 import sys
 import threading
 import time
@@ -43,28 +44,38 @@ class LaserPort:
     """
     Low-level serial port wrapper. Sends commands and collects responses.
 
-    Responses from the firmware always end with a line starting 'OK' or 'ERR'.
-    send_command() collects all lines up to and including that terminator and
-    returns them as a list.
+    A single internal reader thread owns all serial reads and routes lines:
+      - FAULT / STATUS / BOOT lines with no command in flight → unsolicited callback
+      - Everything else (OK, ERR, and STATUS lines while a command is in flight)
+        → response queue read by send_command()
+
+    This avoids the race condition that occurs when a background monitor thread
+    and send_command() both call readline() and compete for the same bytes.
     """
 
     def __init__(self, port: str, baudrate: int = 115200, timeout: float = 5.0):
-        self._port_name = port
-        self._baudrate  = baudrate
-        self._timeout   = timeout
+        self._port_name        = port
+        self._baudrate         = baudrate
+        self._timeout          = timeout
         self._serial: serial.Serial | None = None
-        self._read_lock  = threading.Lock()
-        self._write_lock = threading.Lock()
+        self._write_lock       = threading.Lock()
+        self._response_queue: queue.Queue[str] = queue.Queue()
+        self._cmd_in_flight    = threading.Event()
+        self._unsolicited_cb   = None
+        self._stop_evt         = threading.Event()
+        self._reader_thread: threading.Thread | None = None
 
     def open(self) -> None:
-        self._serial = serial.Serial(
-            self._port_name,
-            self._baudrate,
-            timeout=0.1,           # short read timeout for background polling
-        )
+        self._serial = serial.Serial(self._port_name, self._baudrate, timeout=0.1)
         time.sleep(2.0)            # wait for Teensy USB CDC to enumerate
+        self._stop_evt.clear()
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
 
     def close(self) -> None:
+        self._stop_evt.set()
+        if self._reader_thread:
+            self._reader_thread.join(timeout=1.0)
         if self._serial and self._serial.is_open:
             self._serial.close()
 
@@ -75,20 +86,36 @@ class LaserPort:
     def __exit__(self, *_):
         self.close()
 
-    def readline(self, timeout: float | None = None) -> str | None:
-        """Read one line. Returns None on timeout."""
-        deadline = time.monotonic() + (timeout if timeout is not None else self._timeout)
-        buf = b""
-        with self._read_lock:
-            while time.monotonic() < deadline:
-                if self._serial is None or not self._serial.is_open:
-                    return None
-                chunk = self._serial.readline()
-                if chunk:
-                    buf += chunk
-                    if buf.endswith(b"\n"):
-                        return buf.decode("ascii", errors="replace").strip()
-        return None  # timeout
+    def set_unsolicited_callback(self, cb) -> None:
+        """Register a callback for FAULT/STATUS/BOOT lines not part of a response."""
+        self._unsolicited_cb = cb
+
+    def _reader_loop(self) -> None:
+        """Single reader thread — the only code that ever calls serial.readline()."""
+        while not self._stop_evt.is_set():
+            try:
+                raw = self._serial.readline()
+            except serial.SerialException:
+                break
+            if not raw:
+                continue
+            line = raw.decode("ascii", errors="replace").strip()
+            if not line:
+                continue
+
+            if self._cmd_in_flight.is_set():
+                # A command is pending: all lines go to the response queue so
+                # send_command() can collect them (including STATUS response lines).
+                self._response_queue.put(line)
+            else:
+                # No command pending: FAULT/STATUS/BOOT lines are unsolicited.
+                if line.startswith(("FAULT", "STATUS", "BOOT")):
+                    if self._unsolicited_cb:
+                        try:
+                            self._unsolicited_cb(line)
+                        except Exception as exc:
+                            print(f"[reader] callback error: {exc}", file=sys.stderr)
+                # Unexpected OK/ERR with no command in flight — discard.
 
     def send_command(self, cmd: str, timeout: float | None = None) -> list[str]:
         """
@@ -99,23 +126,32 @@ class LaserPort:
         """
         timeout = timeout if timeout is not None else self._timeout
         with self._write_lock:
+            self._cmd_in_flight.set()
             self._serial.write((cmd.strip() + "\n").encode("ascii"))
             self._serial.flush()
 
-        lines = []
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            line = self.readline(timeout=max(0.0, deadline - time.monotonic()))
-            if line is None:
-                break
-            # Silently pass unsolicited FAULT/STATUS lines to caller via lines list.
-            lines.append(line)
-            if line.startswith("OK ") or line == "OK":
-                return lines
-            if line.startswith("ERR ") or line == "ERR":
-                raise LaserError(f"Firmware error: {line}")
-
-        raise TimeoutError(f"No OK/ERR response to '{cmd}' within {timeout}s; got: {lines}")
+        try:
+            lines    = []
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"No OK/ERR response to '{cmd}' within {timeout}s; got: {lines}"
+                    )
+                try:
+                    line = self._response_queue.get(timeout=remaining)
+                except queue.Empty:
+                    raise TimeoutError(
+                        f"No OK/ERR response to '{cmd}' within {timeout}s; got: {lines}"
+                    )
+                lines.append(line)
+                if line.startswith("OK") or line == "OK":
+                    return lines
+                if line.startswith("ERR") or line == "ERR":
+                    raise LaserError(f"Firmware error: {line}")
+        finally:
+            self._cmd_in_flight.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -231,43 +267,9 @@ class LaserController:
         raise TimeoutError(f"Laser did not reach READY within {timeout:.0f} s")
 
 
-# ---------------------------------------------------------------------------
-# FaultMonitor — background thread for unsolicited messages
-# ---------------------------------------------------------------------------
-
-class FaultMonitor(threading.Thread):
-    """
-    Background thread that reads lines from the firmware and calls a callback
-    for any unsolicited FAULT or STATUS message.
-
-    The main thread and this thread share the same serial port object.
-    The LaserPort.readline() method uses a lock, so concurrent reads are safe,
-    but note that send_command() also reads lines — there is a potential race.
-
-    For production use, a single-reader architecture (all reads on one thread)
-    with a queue is more robust. This simpler approach works for demonstration.
-    """
-
-    def __init__(self, port: LaserPort, callback):
-        super().__init__(daemon=True)
-        self._port     = port
-        self._callback = callback
-        self._stop_evt = threading.Event()
-
-    def run(self) -> None:
-        while not self._stop_evt.is_set():
-            line = self._port.readline(timeout=0.2)
-            if line is None:
-                continue
-            if line.startswith("FAULT") or line.startswith("STATUS"):
-                try:
-                    self._callback(line)
-                except Exception as exc:
-                    print(f"[FaultMonitor] callback raised: {exc}", file=sys.stderr)
-
-    def stop(self) -> None:
-        self._stop_evt.set()
-        self.join(timeout=1.0)
+# FaultMonitor is no longer a separate class. Unsolicited message handling is
+# built into LaserPort's reader thread. Register a callback with:
+#   port.set_unsolicited_callback(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +383,8 @@ Examples:
 
     try:
         with LaserPort(args.port) as port:
-            laser   = LaserController(port)
-            monitor = FaultMonitor(port, fault_callback)
-            monitor.start()
+            port.set_unsolicited_callback(fault_callback)
+            laser = LaserController(port)
 
             try:
                 demo_startup_sequence(laser)
@@ -405,8 +406,6 @@ Examples:
                     print("  Laser disarmed.")
                 except Exception as exc:
                     print(f"  Shutdown error (ignored): {exc}", file=sys.stderr)
-
-                monitor.stop()
 
     except serial.SerialException as exc:
         print(f"Serial port error: {exc}", file=sys.stderr)
