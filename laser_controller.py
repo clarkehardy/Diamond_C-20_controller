@@ -304,10 +304,16 @@ def demo_timed_burst(laser: LaserController, power: float, duration_ms: int) -> 
     laser.set_power(power)
     laser.on(duration_ms=duration_ms)
     status = laser.get_status()
-    freq   = status.get("freq",  "--")
-    duty   = status.get("duty",  "--")
-    print(f"  Calculated frequency: {freq} Hz")
+    freq   = status.get("freq", "--")
+    duty   = status.get("duty", "--")
+    try:
+        pulse_us = float(duty) / float(freq) * 1e6
+        pulse_str = f"{pulse_us:.2f} µs"
+    except (ValueError, ZeroDivisionError):
+        pulse_str = "--"
+    print(f"  Calculated frequency:  {freq} Hz")
     print(f"  Calculated duty cycle: {duty}")
+    print(f"  Calculated pulse width: {pulse_str}")
     print(f"  Firing for {duration_ms} ms...")
 
     # Poll until the firmware stops the laser automatically.
