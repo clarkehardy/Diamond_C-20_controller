@@ -27,13 +27,13 @@ import serial
 # Set the PM100D range to match PM100D_FULL_SCALE_W below — the firmware has
 # no way to read it back.  S314C max is 30 W; default leaves headroom for
 # ~18 W reflected off an OD 1.0 ND dump driven by a 20 W laser.
-PM100D_FULL_SCALE_W    = 30.0    # W, must match PM100D range setting
+PM100D_FULL_SCALE_W    = 11.0    # W, must match PM100D range setting
 PM100D_ANALOG_OUT_FS_V = 2.0     # V at full scale (PM100D spec)
 
 # Ratio of delivered (downstream of the ND filter) to measured (on the meter
 # behind the dump).  OD 1.0 reflective ND transmits ~10 % so ratio ≈ 0.1.
 # Calibrate against a second meter once and update this number.
-TRANSMISSION_RATIO     = 0.1
+TRANSMISSION_RATIO     = 1.0
 
 # Default PID gains.  Tune in-place.  The system gain (W of delivered power per
 # unit POWER fraction) depends on the laser, the optics, and the duty regime,
