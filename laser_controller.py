@@ -33,7 +33,7 @@ PM100D_ANALOG_OUT_FS_V = 2.0     # V at full scale (PM100D spec)
 # Ratio of delivered (downstream of the ND filter) to measured (on the meter
 # behind the dump).  OD 1.0 reflective ND transmits ~10 % so ratio ≈ 0.1.
 # Calibrate against a second meter once and update this number.
-TRANSMISSION_RATIO     = 1.0
+TRANSMISSION_RATIO     = 0.054
 
 # Default PID gains.  Tune in-place.  The system gain (W of delivered power per
 # unit POWER fraction) depends on the laser, the optics, and the duty regime,
@@ -43,7 +43,7 @@ TRANSMISSION_RATIO     = 1.0
 FEEDBACK_KP            = 0.05    # 1 W error → +5 % POWER per update
 FEEDBACK_KI            = 0.10    # 1 W error sustained → +10 % POWER per second
 FEEDBACK_KD            = 0.0
-FEEDBACK_MAX_STEP      = 0.01    # max |ΔPOWER| per loop iteration
+FEEDBACK_MAX_STEP      = 0.1    # max |ΔPOWER| per loop iteration
 FEEDBACK_UPDATE_S      = 0.25    # loop period (4 Hz; PM100D analog out ≈ 10 Hz)
 FEEDBACK_WARMUP_S      = 3.0     # delay after ON before PID engages; the laser
                                  # takes a couple of seconds to start producing
