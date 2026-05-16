@@ -47,7 +47,7 @@ LASER_FULL_POWER_W     = 20.0    # Diamond C-20 rated output
 FEEDBACK_KP            = 0.05    # 1 W error → +5 % POWER per update
 FEEDBACK_KI            = 0.10    # 1 W error sustained → +10 % POWER per second
 FEEDBACK_KD            = 0.0
-FEEDBACK_MAX_STEP      = 0.1    # max |ΔPOWER| per loop iteration
+FEEDBACK_MAX_STEP      = 0.5    # max |ΔPOWER| per loop iteration
 FEEDBACK_UPDATE_S      = 0.25    # loop period (4 Hz; PM100D analog out ≈ 10 Hz)
 FEEDBACK_WARMUP_S      = 3.0     # delay after ON before PID engages; the laser
                                  # takes a couple of seconds to start producing
