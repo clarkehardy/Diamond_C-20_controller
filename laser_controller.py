@@ -45,7 +45,9 @@ FEEDBACK_KI            = 0.10    # 1 W error sustained → +10 % POWER per secon
 FEEDBACK_KD            = 0.0
 FEEDBACK_MAX_STEP      = 0.01    # max |ΔPOWER| per loop iteration
 FEEDBACK_UPDATE_S      = 0.25    # loop period (4 Hz; PM100D analog out ≈ 10 Hz)
-FEEDBACK_DISCONNECT_V  = 0.001   # below this we assume the meter is unplugged
+FEEDBACK_WARMUP_S      = 3.0     # delay after ON before PID engages; the laser
+                                 # takes a couple of seconds to start producing
+                                 # light, during which the meter reads ~0 W.
 
 
 # ---------------------------------------------------------------------------
@@ -437,15 +439,13 @@ class PowerFeedback(threading.Thread):
                  meter:                  PowerMeter,
                  pid:                    PIDController,
                  target_power_W:         float,
-                 update_interval_s:      float = FEEDBACK_UPDATE_S,
-                 disconnect_threshold_V: float = FEEDBACK_DISCONNECT_V):
+                 update_interval_s:      float = FEEDBACK_UPDATE_S):
         super().__init__(daemon=True)
         self._laser                  = laser
         self._meter                  = meter
         self._pid                    = pid
         self._target_W               = target_power_W
         self._update_interval_s      = update_interval_s
-        self._disconnect_threshold_V = disconnect_threshold_V
         self._stop_evt               = threading.Event()
         self._enabled                = False
         self._lock                   = threading.Lock()
@@ -456,7 +456,6 @@ class PowerFeedback(threading.Thread):
         self.latest_measured_W   = 0.0
         self.latest_delivered_W  = 0.0
         self.latest_setpoint     = 0.0
-        self.connected           = False
 
     @property
     def meter(self) -> PowerMeter:
@@ -489,7 +488,6 @@ class PowerFeedback(threading.Thread):
                 print(f"[feedback] meter read failed: {exc}", file=sys.stderr)
                 continue
 
-            connected = volts >= self._disconnect_threshold_V
             measured_W  = self._meter.power_measured_W(volts)
             delivered_W = self._meter.power_delivered_W(volts)
 
@@ -497,14 +495,15 @@ class PowerFeedback(threading.Thread):
                 self.latest_volts       = volts
                 self.latest_measured_W  = measured_W
                 self.latest_delivered_W = delivered_W
-                self.connected          = connected
                 enabled                 = self._enabled
                 target_W                = self._target_W
 
-            # Skip the PID step if disabled OR if the meter appears unplugged.
-            # The latter prevents the loop from chasing a phantom zero reading
-            # all the way to POWER=1.0 if the cable falls off mid-run.
-            if not enabled or not connected:
+            # Skip the PID step if disabled.  We deliberately do NOT auto-disable
+            # on a 0 V reading — a properly wired PM100D drives the analog out
+            # to 0 V when no light is on the sensor, which is indistinguishable
+            # from an unplugged BNC.  The caller is responsible for engaging
+            # feedback only after the laser is actually producing light.
+            if not enabled:
                 with self._lock:
                     self._last_step_t = None
                 continue
@@ -608,29 +607,38 @@ def demo_feedback_hold(laser: LaserController,
                        feedback: "PowerFeedback",
                        target_W: float,
                        hold_s:   float,
-                       initial_power: float = 0.05) -> None:
-    """Hold delivered power at target_W for hold_s seconds using the PID loop."""
+                       initial_power: float = 0.05,
+                       warmup_s:      float = FEEDBACK_WARMUP_S) -> None:
+    """Hold delivered power at target_W for hold_s seconds using the PID loop.
+
+    A warm-up period is inserted between `laser.on()` and the PID engaging so the
+    loop doesn't react to the laser's 0 W startup transient — the meter reads
+    ~0 V for the first second or two while the RF settles and the discharge
+    stabilises."""
     print(f"\n=== Feedback hold: target={target_W:.3f} W delivered, "
           f"duration={hold_s:.1f} s ===")
     print(f"  PM100D full scale:   {feedback.meter.full_scale_W:.1f} W")
     print(f"  Transmission ratio:  {feedback.meter.transmission_ratio:.4f}")
     print(f"  Initial POWER:       {initial_power:.4f}")
+    print(f"  Warm-up:             {warmup_s:.1f} s")
 
     if not feedback.is_alive():
         feedback.start()
 
-    # Brief wait so the thread has a meter sample before we enable PID.
-    time.sleep(feedback._update_interval_s * 1.5)
-    if not feedback.connected:
-        print(f"  ERROR: meter reads {feedback.latest_volts:.4f} V "
-              f"(< {FEEDBACK_DISCONNECT_V:.4f} V threshold). Is the PM100D "
-              f"connected and powered on with an active range?", file=sys.stderr)
-        return
-
+    # Start the laser at the conservative initial power and let it stabilise.
     laser.set_power(initial_power)
     laser.on()
     feedback.set_target(target_W)
+
+    t_warm = time.monotonic()
+    while time.monotonic() - t_warm < warmup_s:
+        time.sleep(0.5)
+        print(f"  [warmup t={time.monotonic()-t_warm:4.1f}s]  "
+              f"V={feedback.latest_volts:.4f}  "
+              f"P_meas={feedback.latest_measured_W:6.3f} W")
+
     feedback.enable(initial_power_fraction=initial_power)
+    print("  Feedback engaged.")
 
     t0 = time.monotonic()
     next_print = t0
