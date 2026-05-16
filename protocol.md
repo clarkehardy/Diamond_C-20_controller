@@ -197,11 +197,16 @@ Query the full system status. Returns several `STATUS` lines followed by `OK STA
 ← STATUS FAULTS NONE
 ← STATUS FREQ 25000
 ← STATUS DUTY 0.5000
+← STATUS METER_V 0.7321
 ← OK STATUS
 ```
 
 `STATUS FREQ` and `STATUS DUTY` show `--` when the laser is not running, and
 `CW` / `1.0000` when running at full power (DC output).
+
+`STATUS METER_V` is the present voltage at the power-meter analog input (pin
+A0). It is always present regardless of whether a meter is wired up — an
+unconnected pin reads near 0 V.
 
 ---
 
@@ -241,6 +246,23 @@ Report firmware version and build date.
 → IDENT
 ← OK IDENT laser_controller v1.0 built Apr 17 2026 12:34:56
 ```
+
+---
+
+### METER
+
+Fast read of the power-meter analog input. Returns a single line with the
+voltage on pin A0 (0.0000 – 3.3000 V). Intended for polling by the host-side
+power-feedback loop where the overhead of a full `STATUS` response would
+matter.
+
+```
+→ METER
+← OK METER 0.7321
+```
+
+The voltage is taken with 12-bit resolution and 32× hardware averaging, so a
+single sample is already heavily filtered.
 
 ---
 

@@ -22,6 +22,13 @@
 #define PIN_TEMP_OK       7    // Digital in  ← RJ45 Pin 4 (Temp OK)    via divider
 #define PIN_VOLTAGE_OK    8    // Digital in  ← RJ45 Pin 5 (Voltage OK) via divider
 #define PIN_STATUS_LED   13    // Built-in LED
+#define PIN_POWER_METER  A0    // Analog in   ← PM100D analog out (0–2 V into 3.3 V ADC)
+
+// ADC configuration for the PM100D analog-out input.
+#define METER_ADC_BITS        12
+#define METER_ADC_AVERAGING   32
+#define METER_ADC_REF_V       3.3f
+#define METER_ADC_MAX_COUNTS  ((1 << METER_ADC_BITS) - 1)
 
 // ---------------------------------------------------------------------------
 // PWM / modulation parameters  (edit these to change operating limits)
@@ -104,8 +111,10 @@ void cmdPower(float f);
 void cmdStatus();
 void cmdFaultReset();
 void cmdIdent();
+void cmdMeter();
 void updateStatusLED();
 void pollStatusPins();
+float readMeterVolts();
 String faultNames(uint8_t faults);
 
 // ===========================================================================
@@ -130,6 +139,12 @@ void setup() {
     pinMode(PIN_LASER_OK,   INPUT);
     pinMode(PIN_TEMP_OK,    INPUT);
     pinMode(PIN_VOLTAGE_OK, INPUT);
+
+    // Power-meter analog input. 12-bit resolution + 32x hardware averaging gives
+    // a low-noise read of the PM100D 0–2 V analog output.
+    pinMode(PIN_POWER_METER, INPUT);
+    analogReadResolution(METER_ADC_BITS);
+    analogReadAveraging(METER_ADC_AVERAGING);
 
     systemState    = STATE_PREIONIZING;
     stateEnteredAt = millis();
@@ -374,6 +389,7 @@ void handleCommand(char *raw) {
     else if (strcmp(verb, "STATUS")      == 0) cmdStatus();
     else if (strcmp(verb, "FAULT_RESET") == 0) cmdFaultReset();
     else if (strcmp(verb, "IDENT")       == 0) cmdIdent();
+    else if (strcmp(verb, "METER")       == 0) cmdMeter();
     else {
         Serial.print("ERR UNKNOWN_COMMAND ");
         Serial.println(verb);
@@ -503,6 +519,7 @@ void cmdStatus() {
         Serial.println("STATUS FREQ --");
         Serial.println("STATUS DUTY --");
     }
+    Serial.print("STATUS METER_V "); Serial.println(readMeterVolts(), 4);
     Serial.println("OK STATUS");
 }
 
@@ -554,9 +571,20 @@ void cmdIdent() {
     Serial.println(__TIME__);
 }
 
+void cmdMeter() {
+    // Fast, dedicated read for the Python feedback loop — avoids parsing the
+    // full STATUS response when only the meter voltage is needed.
+    Serial.print("OK METER ");
+    Serial.println(readMeterVolts(), 4);
+}
+
 // ===========================================================================
 // Helpers
 // ===========================================================================
+
+float readMeterVolts() {
+    return (float)analogRead(PIN_POWER_METER) * METER_ADC_REF_V / (float)METER_ADC_MAX_COUNTS;
+}
 
 String faultNames(uint8_t faults) {
     String s = "";

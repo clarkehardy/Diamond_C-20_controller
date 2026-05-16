@@ -29,6 +29,31 @@ Pin 1 is on the **left** when looking at the front of the laser connector.
 Use shielded Cat5e/Cat6 cable. Connect the cable shield to the chassis ground of
 your controller enclosure. A floating ground is an unsafe condition (manual p.37).
 
+### Power meter analog input (optional)
+
+For closed-loop power regulation, a Thorlabs PM100D with a thermal sensor (e.g.
+S314C) can be wired to a free analog input. The PM100D's BNC analog output
+swings 0–2 V over the selected range and is safe to feed directly into a 3.3 V
+Teensy ADC pin.
+
+| Signal | PM100D | Teensy 4.0 Pin | Notes |
+|---|---|:---:|---|
+| Meter analog out | BNC center | **14 (A0)** | 12-bit ADC, 0–2 V full scale |
+| Meter ground     | BNC shell  | **GND**      | Any GND pad; the one adjacent to pin 14 is convenient |
+
+The Teensy reads this pin with `analogReadAveraging(32)` so the firmware does
+its own noise filtering. The PM100D range is **not** read back over the serial
+link — set the meter to the range that matches `PM100D_FULL_SCALE_W` in
+`laser_controller.py` (default 30 W).
+
+> **Protection note:** The PM100D analog output is rated 0–2 V under normal
+> operation but the manual does not guarantee its behaviour under fault
+> conditions (overrange, sensor disconnected, power loss). If you want belt-
+> and-braces protection against a transient swing above 3.3 V, put a 1 kΩ
+> series resistor between the BNC center and pin 14 and a 3.3 V Zener (or BAT54
+> clamp) from pin 14 to 3V3. The Teensy ADC's input impedance handles the
+> series resistor without measurable error.
+
 ---
 
 ## Voltage Dividers (REQUIRED on status inputs)
@@ -95,6 +120,10 @@ Pin 8  ─────────────┤
                     └── R2=15k ── GND
 GND    ──────────────────────────────── Pin 8  (Ground)
                                         Pin 6  (Internal — tie to GND)
+
+Optional:                               PM100D
+Pin 14 (A0) ─────────────────────────── BNC center  (Analog out, 0–2 V)
+GND    ──────────────────────────────── BNC shell   (Analog out ground)
 ```
 
 ---

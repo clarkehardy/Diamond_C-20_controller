@@ -21,6 +21,34 @@ import serial
 
 
 # ---------------------------------------------------------------------------
+# Hard-coded power-meter configuration  (edit these for your setup)
+# ---------------------------------------------------------------------------
+# PM100D analog output: 0–2 V represents 0 to the currently selected range.
+# Set the PM100D range to match PM100D_FULL_SCALE_W below — the firmware has
+# no way to read it back.  S314C max is 30 W; default leaves headroom for
+# ~18 W reflected off an OD 1.0 ND dump driven by a 20 W laser.
+PM100D_FULL_SCALE_W    = 30.0    # W, must match PM100D range setting
+PM100D_ANALOG_OUT_FS_V = 2.0     # V at full scale (PM100D spec)
+
+# Ratio of delivered (downstream of the ND filter) to measured (on the meter
+# behind the dump).  OD 1.0 reflective ND transmits ~10 % so ratio ≈ 0.1.
+# Calibrate against a second meter once and update this number.
+TRANSMISSION_RATIO     = 0.1
+
+# Default PID gains.  Tune in-place.  The system gain (W of delivered power per
+# unit POWER fraction) depends on the laser, the optics, and the duty regime,
+# so these defaults are deliberately conservative.  MAX_STEP caps how much the
+# POWER fraction can move in a single update — a hard guard against the loop
+# slamming the laser if a parameter is wrong.
+FEEDBACK_KP            = 0.05    # 1 W error → +5 % POWER per update
+FEEDBACK_KI            = 0.10    # 1 W error sustained → +10 % POWER per second
+FEEDBACK_KD            = 0.0
+FEEDBACK_MAX_STEP      = 0.01    # max |ΔPOWER| per loop iteration
+FEEDBACK_UPDATE_S      = 0.25    # loop period (4 Hz; PM100D analog out ≈ 10 Hz)
+FEEDBACK_DISCONNECT_V  = 0.001   # below this we assume the meter is unplugged
+
+
+# ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
 
@@ -241,6 +269,14 @@ class LaserController:
                 return line[len("OK IDENT"):].strip()
         return ""
 
+    def read_meter(self) -> float:
+        """Return the PM100D analog-out voltage as measured by the Teensy ADC."""
+        lines = self._port.send_command("METER")
+        for line in lines:
+            if line.startswith("OK METER"):
+                return float(line[len("OK METER"):].strip())
+        raise LaserError(f"Unexpected METER response: {lines}")
+
     def wait_for_ready(self, timeout: float = 90.0, poll_interval: float = 2.0) -> None:
         """
         Block until the laser reports STATE READY (pre-ionization complete).
@@ -270,6 +306,225 @@ class LaserController:
 # FaultMonitor is no longer a separate class. Unsolicited message handling is
 # built into LaserPort's reader thread. Register a callback with:
 #   port.set_unsolicited_callback(fn)
+
+
+# ---------------------------------------------------------------------------
+# PowerMeter — converts PM100D analog-out volts to absorbed/delivered watts
+# ---------------------------------------------------------------------------
+
+class PowerMeter:
+    """
+    Translates the PM100D 0–2 V analog output (sampled by the Teensy ADC) into
+    measured and delivered laser power.
+
+    "Measured" = power hitting the PM100D (e.g. the reflected leg of an OD 1.0
+    reflective ND).  "Delivered" = the fraction that goes downstream to the
+    target, computed as measured * transmission_ratio.
+    """
+
+    def __init__(self,
+                 full_scale_W:        float = PM100D_FULL_SCALE_W,
+                 analog_fs_V:         float = PM100D_ANALOG_OUT_FS_V,
+                 transmission_ratio:  float = TRANSMISSION_RATIO):
+        self.full_scale_W       = full_scale_W
+        self.analog_fs_V        = analog_fs_V
+        self.transmission_ratio = transmission_ratio
+
+    def power_measured_W(self, volts: float) -> float:
+        return volts / self.analog_fs_V * self.full_scale_W
+
+    def power_delivered_W(self, volts: float) -> float:
+        return self.power_measured_W(volts) * self.transmission_ratio
+
+
+# ---------------------------------------------------------------------------
+# PIDController — simple PI(D) with rate limiting and conditional-integration
+# ---------------------------------------------------------------------------
+
+class PIDController:
+    """
+    Simple PID with two safety features:
+
+      1. Rate limit:  |output - prev_output|  capped at max_step per call.
+         Guards against the loop demanding a big setpoint jump when a gain
+         is wrong or the measurement is noisy.
+
+      2. Anti-windup: the integral state is only committed if the (rate-limited)
+         output is not saturated against output_min/output_max. Prevents the
+         I term from accumulating against a clamp.
+    """
+
+    def __init__(self,
+                 kp:         float,
+                 ki:         float,
+                 kd:         float = 0.0,
+                 max_step:   float = 0.02,
+                 output_min: float = 0.0,
+                 output_max: float = 1.0):
+        self.kp         = kp
+        self.ki         = ki
+        self.kd         = kd
+        self.max_step   = max_step
+        self.output_min = output_min
+        self.output_max = output_max
+        self._integral    = 0.0
+        self._last_error  = None
+        self._last_output = None
+
+    def reset(self, initial_output: float = 0.0) -> None:
+        self._integral    = 0.0
+        self._last_error  = None
+        self._last_output = initial_output
+
+    def update(self, setpoint: float, measurement: float, dt: float) -> float:
+        if dt <= 0.0:
+            return self._last_output if self._last_output is not None else 0.0
+
+        error = setpoint - measurement
+        tentative_integral = self._integral + error * dt
+        d_term = ((error - self._last_error) / dt
+                  if self._last_error is not None else 0.0)
+        raw = (self.kp * error
+               + self.ki * tentative_integral
+               + self.kd * d_term)
+
+        # Rate limit against the previous applied output.
+        if self._last_output is not None:
+            lo = self._last_output - self.max_step
+            hi = self._last_output + self.max_step
+            raw = max(lo, min(hi, raw))
+
+        # Saturate at output bounds.
+        clamped = max(self.output_min, min(self.output_max, raw))
+
+        # Conditional integration: commit only if not saturated.  abs() is
+        # there to swallow floating-point hair when raw lands exactly on
+        # the clamp.
+        if abs(clamped - raw) < 1e-12:
+            self._integral = tentative_integral
+
+        self._last_error  = error
+        self._last_output = clamped
+        return clamped
+
+
+# ---------------------------------------------------------------------------
+# PowerFeedback — background thread that closes the loop
+# ---------------------------------------------------------------------------
+
+class PowerFeedback(threading.Thread):
+    """
+    Periodically reads the PM100D voltage via the Teensy, converts it to
+    delivered watts, runs a PID step, and pushes a new POWER fraction to the
+    firmware.
+
+    Lifecycle:
+        fb = PowerFeedback(laser, meter, pid, target_power_W=2.0)
+        fb.start()                          # thread runs; feedback OFF
+        ...
+        fb.enable(initial_power=0.05)       # start regulating
+        ...
+        fb.disable()                        # stop regulating; thread keeps polling
+        fb.stop(); fb.join()                # terminate thread
+
+    The thread also serves as a passive monitor — `latest_volts` and
+    `latest_measured_W` are kept up to date even when feedback is disabled,
+    so the host can log the meter without writing a separate poller.
+    """
+
+    def __init__(self,
+                 laser:                  "LaserController",
+                 meter:                  PowerMeter,
+                 pid:                    PIDController,
+                 target_power_W:         float,
+                 update_interval_s:      float = FEEDBACK_UPDATE_S,
+                 disconnect_threshold_V: float = FEEDBACK_DISCONNECT_V):
+        super().__init__(daemon=True)
+        self._laser                  = laser
+        self._meter                  = meter
+        self._pid                    = pid
+        self._target_W               = target_power_W
+        self._update_interval_s      = update_interval_s
+        self._disconnect_threshold_V = disconnect_threshold_V
+        self._stop_evt               = threading.Event()
+        self._enabled                = False
+        self._lock                   = threading.Lock()
+        self._last_step_t            = None
+
+        # Shared state — read by the main thread; protected by _lock.
+        self.latest_volts        = 0.0
+        self.latest_measured_W   = 0.0
+        self.latest_delivered_W  = 0.0
+        self.latest_setpoint     = 0.0
+        self.connected           = False
+
+    @property
+    def meter(self) -> PowerMeter:
+        return self._meter
+
+    def set_target(self, power_W: float) -> None:
+        with self._lock:
+            self._target_W = power_W
+
+    def enable(self, initial_power_fraction: float) -> None:
+        """Begin regulating. initial_power_fraction is the POWER value already
+        applied by the caller — the PID starts from there to avoid a jump."""
+        with self._lock:
+            self._pid.reset(initial_output=initial_power_fraction)
+            self._last_step_t = None
+            self._enabled = True
+
+    def disable(self) -> None:
+        with self._lock:
+            self._enabled = False
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+    def run(self) -> None:
+        while not self._stop_evt.wait(self._update_interval_s):
+            try:
+                volts = self._laser.read_meter()
+            except (LaserError, TimeoutError) as exc:
+                print(f"[feedback] meter read failed: {exc}", file=sys.stderr)
+                continue
+
+            connected = volts >= self._disconnect_threshold_V
+            measured_W  = self._meter.power_measured_W(volts)
+            delivered_W = self._meter.power_delivered_W(volts)
+
+            with self._lock:
+                self.latest_volts       = volts
+                self.latest_measured_W  = measured_W
+                self.latest_delivered_W = delivered_W
+                self.connected          = connected
+                enabled                 = self._enabled
+                target_W                = self._target_W
+
+            # Skip the PID step if disabled OR if the meter appears unplugged.
+            # The latter prevents the loop from chasing a phantom zero reading
+            # all the way to POWER=1.0 if the cable falls off mid-run.
+            if not enabled or not connected:
+                with self._lock:
+                    self._last_step_t = None
+                continue
+
+            now = time.monotonic()
+            with self._lock:
+                if self._last_step_t is None:
+                    self._last_step_t = now
+                    continue
+                dt = now - self._last_step_t
+                self._last_step_t = now
+
+            new_power = self._pid.update(target_W, delivered_W, dt)
+
+            try:
+                self._laser.set_power(new_power)
+                with self._lock:
+                    self.latest_setpoint = new_power
+            except LaserError as exc:
+                print(f"[feedback] set_power failed: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +604,52 @@ def demo_power_sweep(laser: LaserController, steps: int = 10, dwell_ms: int = 50
     print("  Sweep complete.")
 
 
+def demo_feedback_hold(laser: LaserController,
+                       feedback: "PowerFeedback",
+                       target_W: float,
+                       hold_s:   float,
+                       initial_power: float = 0.05) -> None:
+    """Hold delivered power at target_W for hold_s seconds using the PID loop."""
+    print(f"\n=== Feedback hold: target={target_W:.3f} W delivered, "
+          f"duration={hold_s:.1f} s ===")
+    print(f"  PM100D full scale:   {feedback.meter.full_scale_W:.1f} W")
+    print(f"  Transmission ratio:  {feedback.meter.transmission_ratio:.4f}")
+    print(f"  Initial POWER:       {initial_power:.4f}")
+
+    if not feedback.is_alive():
+        feedback.start()
+
+    # Brief wait so the thread has a meter sample before we enable PID.
+    time.sleep(feedback._update_interval_s * 1.5)
+    if not feedback.connected:
+        print(f"  ERROR: meter reads {feedback.latest_volts:.4f} V "
+              f"(< {FEEDBACK_DISCONNECT_V:.4f} V threshold). Is the PM100D "
+              f"connected and powered on with an active range?", file=sys.stderr)
+        return
+
+    laser.set_power(initial_power)
+    laser.on()
+    feedback.set_target(target_W)
+    feedback.enable(initial_power_fraction=initial_power)
+
+    t0 = time.monotonic()
+    next_print = t0
+    try:
+        while time.monotonic() - t0 < hold_s:
+            time.sleep(0.1)
+            if time.monotonic() >= next_print:
+                print(f"  t={time.monotonic()-t0:5.1f}s  "
+                      f"V={feedback.latest_volts:.4f}  "
+                      f"P_meas={feedback.latest_measured_W:6.3f} W  "
+                      f"P_deliv={feedback.latest_delivered_W:6.3f} W  "
+                      f"POWER={feedback.latest_setpoint:.4f}")
+                next_print += 1.0
+    finally:
+        feedback.disable()
+        laser.off()
+        print("  Hold complete; feedback disabled.")
+
+
 # ---------------------------------------------------------------------------
 # main()
 # ---------------------------------------------------------------------------
@@ -367,16 +668,25 @@ Examples:
 
   # Low-power burst (1% — tests variable-frequency regime)
   python laser_controller.py --port /dev/ttyACM0 --power 0.01 --duration 1000
+
+  # Hold 2 W delivered for 30 s using PM100D feedback (requires meter connected)
+  python laser_controller.py --port /dev/ttyACM0 --feedback 2.0 --hold 30
         """,
     )
-    parser.add_argument("--port",     required=True,            help="Serial port (e.g. /dev/ttyACM0 or COM3)")
-    parser.add_argument("--power",    type=float, default=0.5,  help="Power fraction 0.0–1.0 (default 0.5)")
-    parser.add_argument("--duration", type=int,   default=2000, help="Burst duration in ms (default 2000)")
-    parser.add_argument("--sweep",    action="store_true",       help="Run power sweep instead of single burst")
+    parser.add_argument("--port",     required=True,             help="Serial port (e.g. /dev/ttyACM0 or COM3)")
+    parser.add_argument("--power",    type=float, default=0.5,   help="Power fraction 0.0–1.0 (default 0.5)")
+    parser.add_argument("--duration", type=int,   default=2000,  help="Burst duration in ms (default 2000)")
+    parser.add_argument("--sweep",    action="store_true",        help="Run power sweep instead of single burst")
+    parser.add_argument("--feedback", type=float, default=None,
+                        help="Hold delivered power (in W) using PM100D analog-out feedback")
+    parser.add_argument("--hold",     type=float, default=10.0,  help="Duration (s) for --feedback hold (default 10)")
     args = parser.parse_args()
 
     if not (0.0 < args.power <= 1.0):
         print("ERROR: --power must be between 0.0 (exclusive) and 1.0 (inclusive).")
+        sys.exit(1)
+    if args.feedback is not None and args.feedback <= 0.0:
+        print("ERROR: --feedback target power must be > 0.")
         sys.exit(1)
 
     fault_lines = []
@@ -392,10 +702,20 @@ Examples:
             port.set_unsolicited_callback(fault_callback)
             laser = LaserController(port)
 
+            meter    = PowerMeter()
+            pid      = PIDController(kp=FEEDBACK_KP, ki=FEEDBACK_KI, kd=FEEDBACK_KD,
+                                     max_step=FEEDBACK_MAX_STEP)
+            feedback = PowerFeedback(laser, meter, pid,
+                                     target_power_W=args.feedback or 0.0)
+
             try:
                 demo_startup_sequence(laser)
 
-                if args.sweep:
+                if args.feedback is not None:
+                    demo_feedback_hold(laser, feedback,
+                                       target_W=args.feedback,
+                                       hold_s=args.hold)
+                elif args.sweep:
                     demo_power_sweep(laser)
                 else:
                     demo_timed_burst(laser, args.power, args.duration)
@@ -407,6 +727,10 @@ Examples:
             finally:
                 print("\n=== Shutdown ===")
                 try:
+                    feedback.disable()
+                    feedback.stop()
+                    if feedback.is_alive():
+                        feedback.join(timeout=1.0)
                     laser.off()
                     laser.disable()
                     print("  Laser disarmed.")

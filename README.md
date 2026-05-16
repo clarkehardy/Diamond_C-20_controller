@@ -30,6 +30,7 @@ See [`pin_map.md`](pin_map.md) for the full wiring diagram. Summary:
 | 6 | 3 | Laser OK input (via 10 kΩ/15 kΩ divider) |
 | 7 | 4 | Temperature OK input (via 10 kΩ/15 kΩ divider) |
 | 8 | 5 | Voltage OK input (via 10 kΩ/15 kΩ divider) |
+| 14 (A0) | — | PM100D analog out (optional, for power feedback) |
 | GND | 8 | Ground |
 
 ## Loading the Firmware
@@ -73,6 +74,7 @@ See [`protocol.md`](protocol.md) for the full reference. Quick summary:
 | `OFF` | Stop modulation (Control Enable stays asserted) |
 | `STATUS` | Query full system status |
 | `FAULT_RESET` | Attempt fault recovery |
+| `METER` | Read the PM100D analog input voltage |
 
 ## Power Control
 
@@ -95,6 +97,35 @@ Below 2.5% the frequency is reduced to keep the pulse width at exactly 1 µs.
 ## Startup Sequence
 
 After powering the laser, it pre-ionizes for approximately 42 seconds before it can fire. The firmware monitors the Laser OK pin and reports `STATUS READY` when pre-ionization is complete. The Python driver's `wait_for_ready()` method handles this automatically.
+
+## Power Feedback (optional)
+
+The Diamond C-20 can drift slowly by ±10–20% over minutes. To regulate it, wire
+a Thorlabs PM100D's analog output to Teensy pin 14 (A0) and ground (see
+`pin_map.md`). A typical setup uses an OD 1.0 reflective ND filter as a beam
+dump, with the PM100D + S314C measuring the rejected ~90% so the transmitted
+~10% is left to do work.
+
+Three constants at the top of `laser_controller.py` describe the optics:
+
+```python
+PM100D_FULL_SCALE_W    = 30.0    # PM100D range setting in W
+PM100D_ANALOG_OUT_FS_V = 2.0     # PM100D analog out at full scale
+TRANSMISSION_RATIO     = 0.1     # P_delivered / P_measured (calibrate this)
+```
+
+Run a feedback hold at, say, 2 W delivered for 30 seconds:
+
+```bash
+python laser_controller.py --port /dev/ttyACM0 --feedback 2.0 --hold 30
+```
+
+The host-side PID has a per-step rate limit (`FEEDBACK_MAX_STEP`) and
+conditional-integration anti-windup, so a misconfigured gain cannot demand a
+large POWER jump in one update. The loop also auto-suspends when the meter
+reads below `FEEDBACK_DISCONNECT_V` (≈ 0 V), which is what an unplugged BNC
+looks like to a high-Z ADC pin — so you only need to plug the meter in when
+you want regulation, and pull it out otherwise.
 
 ## Fault Handling
 
