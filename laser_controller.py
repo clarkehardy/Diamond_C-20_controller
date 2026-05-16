@@ -376,8 +376,14 @@ class PIDController:
         self._integral    = 0.0
         self._last_error  = None
         self._last_output = None
+        self._baseline    = 0.0   # output when error=0 and integral=0
 
     def reset(self, initial_output: float = 0.0) -> None:
+        # Baseline = initial_output so that with zero error and an empty
+        # integrator the PID returns initial_output, not 0.  Without this the
+        # rate limiter walks the output toward 0 by max_step per call until
+        # the integral catches up.
+        self._baseline    = initial_output
         self._integral    = 0.0
         self._last_error  = None
         self._last_output = initial_output
@@ -390,7 +396,8 @@ class PIDController:
         tentative_integral = self._integral + error * dt
         d_term = ((error - self._last_error) / dt
                   if self._last_error is not None else 0.0)
-        raw = (self.kp * error
+        raw = (self._baseline
+               + self.kp * error
                + self.ki * tentative_integral
                + self.kd * d_term)
 
