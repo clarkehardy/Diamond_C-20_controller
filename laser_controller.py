@@ -35,6 +35,10 @@ PM100D_ANALOG_OUT_FS_V = 2.0     # V at full scale (PM100D spec)
 # Calibrate against a second meter once and update this number.
 TRANSMISSION_RATIO     = 0.054
 
+# Rated full output of the laser, used only to seed the initial POWER fraction
+# at the start of a feedback hold so the PID doesn't have to ramp from scratch.
+LASER_FULL_POWER_W     = 20.0    # Diamond C-20 rated output
+
 # Default PID gains.  Tune in-place.  The system gain (W of delivered power per
 # unit POWER fraction) depends on the laser, the optics, and the duty regime,
 # so these defaults are deliberately conservative.  MAX_STEP caps how much the
@@ -607,7 +611,7 @@ def demo_feedback_hold(laser: LaserController,
                        feedback: "PowerFeedback",
                        target_W: float,
                        hold_s:   float,
-                       initial_power: float = 0.05,
+                       initial_power: float = None,
                        warmup_s:      float = FEEDBACK_WARMUP_S) -> None:
     """Hold delivered power at target_W for hold_s seconds using the PID loop.
 
@@ -615,11 +619,20 @@ def demo_feedback_hold(laser: LaserController,
     loop doesn't react to the laser's 0 W startup transient — the meter reads
     ~0 V for the first second or two while the RF settles and the discharge
     stabilises."""
+    meter = feedback.meter
+    if initial_power is None:
+        # Open-loop estimate of the POWER fraction that hits target_W at the
+        # laser's rated full output.  Clamped to leave headroom against the
+        # POWER=1.0 saturation and against zero.
+        raw_estimate  = target_W / (LASER_FULL_POWER_W * meter.transmission_ratio)
+        initial_power = max(0.001, min(0.95, raw_estimate))
+
     print(f"\n=== Feedback hold: target={target_W:.3f} W delivered, "
           f"duration={hold_s:.1f} s ===")
-    print(f"  PM100D full scale:   {feedback.meter.full_scale_W:.1f} W")
-    print(f"  Transmission ratio:  {feedback.meter.transmission_ratio:.4f}")
-    print(f"  Initial POWER:       {initial_power:.4f}")
+    print(f"  PM100D full scale:   {meter.full_scale_W:.1f} W")
+    print(f"  Transmission ratio:  {meter.transmission_ratio:.4f}")
+    print(f"  Initial POWER:       {initial_power:.4f}  "
+          f"(open-loop estimate for {target_W:.3f} W with {LASER_FULL_POWER_W:.1f} W laser)")
     print(f"  Warm-up:             {warmup_s:.1f} s")
 
     if not feedback.is_alive():
